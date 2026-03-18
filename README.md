@@ -89,7 +89,7 @@ Automated stop-loss management for your Hyperliquid positions:
 npm install -g nansen-cli
 
 # Install Hyperliquid CLI (for trailing stops)
-npm install -g hyperliquid-cli
+npm install -g @chrisling-dev/hyperliquid-cli
 ```
 
 ### Setup
@@ -197,7 +197,7 @@ anthroalert/
 
 - Python 3.10+
 - [Nansen CLI](https://github.com/nansen-ai/nansen-cli) with valid API key
-- [Hyperliquid CLI](https://github.com/hyperliquid-ai/hyperliquid-cli) (for trailing stops)
+- [Hyperliquid CLI](https://github.com/chrisling-dev/hyperliquid-cli) (for trailing stops)
 - Telegram bot (create via [@BotFather](https://t.me/BotFather))
 
 ## Disclaimer
