@@ -1,35 +1,50 @@
 #!/usr/bin/env python3
 """
 Trailing Stop Loss for Hyperliquid
-- 1% trail from peak/trough
-- Activates after 1% profit
+- Places REAL stop orders on exchange (visible in UI)
+- 1.5% trail from peak/trough  
+- Updates stop order as price moves favorably
 - Polls every 30s
-- Tracks all positions
-- Posts updates to Telegram
 """
+
+import sys
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 import json
 import os
-import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
-import requests
+import requests as http_requests
 from dotenv import load_dotenv
+from eth_account import Account
+from hyperliquid.info import Info
+from hyperliquid.exchange import Exchange
+from hyperliquid.utils import constants
 
 load_dotenv()
 
 # Config
 TRAIL_PERCENT = 0.015  # 1.5%
-ACTIVATION_PERCENT = 0  # Activate immediately
+ACTIVATION_PERCENT = 0  # Activate immediately (in profit zone)
 POLL_INTERVAL = 30  # seconds
-SIGNIFICANT_MOVE = 0.005  # 0.5% move to notify stop adjustment
+SIGNIFICANT_MOVE = 0.005  # 0.5% move to update stop order
+
+# Hyperliquid
+PRIVATE_KEY = os.getenv("HYPERLIQUID_PRIVATE_KEY", "")
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Initialize Hyperliquid clients
+account = Account.from_key(PRIVATE_KEY)
+ADDRESS = account.address
+info = Info(constants.MAINNET_API_URL, skip_ws=True)
+exchange = Exchange(account, constants.MAINNET_API_URL)
 
 
 @dataclass
@@ -43,6 +58,7 @@ class TrackedPosition:
     trailing_active: bool = False
     last_stop: float = 0.0
     last_notified_stop: float = 0.0
+    stop_order_oid: Optional[int] = None
 
 
 # Global state
@@ -63,101 +79,129 @@ def post_telegram(message: str) -> bool:
         "disable_web_page_preview": True,
     }
     try:
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = http_requests.post(url, json=payload, timeout=10)
         return resp.json().get("ok", False)
     except Exception as e:
         print(f"Telegram error: {e}")
         return False
 
 
-def run_hl_command(args: list) -> Optional[dict]:
-    """Run hyperliquid-cli command and return JSON."""
-    cmd = ["hl"] + args + ["--json"]
-    env = os.environ.copy()
-    env["HYPERLIQUID_PRIVATE_KEY"] = os.getenv("HYPERLIQUID_PRIVATE_KEY", "")
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
-        if result.returncode != 0:
-            print(f"HL error: {result.stderr}")
-            return None
-        return json.loads(result.stdout)
-    except Exception as e:
-        print(f"HL command failed: {e}")
-        return None
-
-
 def get_positions() -> list:
     """Get current positions from Hyperliquid."""
-    data = run_hl_command(["account", "positions"])
-    if not data:
+    try:
+        user_state = info.user_state(ADDRESS)
+        positions_data = user_state.get("assetPositions", [])
+        result = []
+        for p in positions_data:
+            pos = p.get("position", {})
+            if pos:
+                result.append({
+                    "coin": pos.get("coin"),
+                    "size": float(pos.get("szi", 0)),
+                    "entry_price": float(pos.get("entryPx", 0)),
+                })
+        return result
+    except Exception as e:
+        print(f"Error getting positions: {e}")
         return []
-    return data.get("positions", data) if isinstance(data, dict) else data
 
 
 def get_price(coin: str) -> Optional[float]:
-    """Get current price for a coin."""
-    data = run_hl_command(["asset", "price", coin])
-    if not data:
-        return None
-    return float(data.get("price", data.get("mid", 0)))
-
-
-def close_position(coin: str, side: str, size: float) -> bool:
-    """Close a position with IOC limit order (market-like execution)."""
-    # To close: sell if long, buy if short
-    close_side = "sell" if side == "long" else "buy"
-    
-    # Get current price for IOC limit order
-    current_price = get_price(coin)
-    if not current_price:
-        print(f"Failed to get price for {coin}")
-        return False
-    
-    # Set aggressive limit price with 2% slippage for guaranteed fill
-    if close_side == "buy":
-        limit_price = current_price * 1.02  # 2% above market to buy
-    else:
-        limit_price = current_price * 0.98  # 2% below market to sell
-    
-    # Format price with proper precision (5 sig figs max, strip trailing zeros)
-    price_str = f"{limit_price:.5g}"
-    size_str = f"{abs(size):.6g}"
-    
-    # Use IOC limit order instead of market order
-    cmd = ["hl", "order", "limit", close_side, size_str, coin, price_str, "--tif", "Ioc", "--reduce-only"]
-    print(f"Executing: {' '.join(cmd)}")
-    
-    env = os.environ.copy()
-    env["HYPERLIQUID_PRIVATE_KEY"] = os.getenv("HYPERLIQUID_PRIVATE_KEY", "")
-    
+    """Get current mid price for a coin."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
-        if result.returncode != 0:
-            print(f"Close order error: {result.stderr or result.stdout}")
-        return result.returncode == 0
+        all_mids = info.all_mids()
+        return float(all_mids.get(coin, 0))
     except Exception as e:
-        print(f"Close order failed: {e}")
+        print(f"Error getting price for {coin}: {e}")
+        return None
+
+
+def get_existing_stops(coin: str) -> List[dict]:
+    """Get existing stop orders for a coin."""
+    try:
+        resp = http_requests.post(
+            constants.MAINNET_API_URL + '/info',
+            json={'type': 'frontendOpenOrders', 'user': ADDRESS},
+            timeout=10
+        )
+        orders = resp.json()
+        return [o for o in orders if o.get('coin') == coin and o.get('isTrigger') and o.get('orderType') == 'Stop Market']
+    except Exception as e:
+        print(f"Error getting existing stops: {e}")
+        return []
+
+
+def cancel_order(oid: int, coin: str) -> bool:
+    """Cancel an order by ID."""
+    try:
+        result = exchange.cancel(coin, oid)
+        print(f"Cancel {oid}: {result.get('status')}")
+        return result.get("status") == "ok"
+    except Exception as e:
+        print(f"Error canceling order {oid}: {e}")
         return False
+
+
+def place_stop_order(coin: str, side: str, size: float, trigger_price: float) -> Optional[int]:
+    """Place a stop-loss order on Hyperliquid. Returns order ID if successful."""
+    try:
+        # Cancel any existing stops for this coin first
+        existing = get_existing_stops(coin)
+        for stop in existing:
+            cancel_order(stop['oid'], coin)
+            time.sleep(0.5)  # Brief pause between cancels
+        
+        # For closing: buy to close short, sell to close long
+        is_buy = side == "short"
+        
+        # Round prices
+        trigger_price = round(trigger_price, 1)
+        
+        # Limit price with slippage
+        if is_buy:
+            limit_price = round(trigger_price * 1.02, 1)
+        else:
+            limit_price = round(trigger_price * 0.98, 1)
+        
+        print(f"Placing stop: {coin} trigger={trigger_price} limit={limit_price}")
+        
+        result = exchange.order(
+            coin,
+            is_buy,
+            size,
+            limit_price,
+            {"trigger": {"triggerPx": trigger_price, "isMarket": True, "tpsl": "sl"}},
+            reduce_only=True,
+        )
+        
+        if result.get("status") == "ok":
+            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+            if statuses and "resting" in statuses[0]:
+                oid = statuses[0]["resting"].get("oid")
+                print(f"✅ Stop placed: {coin} @ ${trigger_price} (oid: {oid})")
+                return oid
+        
+        print(f"❌ Failed to place stop: {result}")
+        return None
+        
+    except Exception as e:
+        print(f"Error placing stop order: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def calculate_stop(pos: TrackedPosition, current_price: float) -> float:
-    """Calculate current stop loss level.
-    
-    Profit-only trailing: only trail when stop would be in profit zone.
-    - Long: stop must be above entry
-    - Short: stop must be below entry
-    """
+    """Calculate current stop loss level."""
     if pos.side == "long":
         raw_stop = pos.highest_price * (1 - TRAIL_PERCENT)
-        # Only trail if stop is above entry (profit zone)
         if raw_stop <= pos.entry_price:
-            return 0  # No stop yet, waiting for profit
+            return 0
         return raw_stop
     else:
         raw_stop = pos.lowest_price * (1 + TRAIL_PERCENT)
-        # Only trail if stop is below entry (profit zone)
         if raw_stop >= pos.entry_price:
-            return float('inf')  # No stop yet, waiting for profit
+            return float('inf')
         return raw_stop
 
 
@@ -169,25 +213,8 @@ def calculate_pnl_percent(pos: TrackedPosition, current_price: float) -> float:
         return (pos.entry_price - current_price) / pos.entry_price
 
 
-def check_stop_triggered(pos: TrackedPosition, current_price: float) -> bool:
-    """Check if stop loss is triggered."""
-    if not pos.trailing_active:
-        return False
-    
-    stop = calculate_stop(pos, current_price)
-    
-    # No valid stop yet (waiting for profit zone)
-    if (pos.side == "long" and stop == 0) or (pos.side == "short" and stop == float('inf')):
-        return False
-    
-    if pos.side == "long":
-        return current_price <= stop
-    else:
-        return current_price >= stop
-
-
 def process_position(pos: TrackedPosition, current_price: float) -> None:
-    """Process a single position - update tracking and check stops."""
+    """Process a single position."""
     pnl_pct = calculate_pnl_percent(pos, current_price)
     
     # Check activation
@@ -202,11 +229,15 @@ def process_position(pos: TrackedPosition, current_price: float) -> None:
             
             emoji = "🟢" if pos.side == "long" else "🔴"
             
-            # Check if stop is valid (in profit zone)
             if (pos.side == "long" and stop == 0) or (pos.side == "short" and stop == float('inf')):
                 stop_str = "waiting for profit"
             else:
-                stop_str = f"${stop:,.2f}"
+                oid = place_stop_order(pos.coin, pos.side, pos.size, stop)
+                if oid:
+                    pos.stop_order_oid = oid
+                    stop_str = f"${stop:,.2f} ✅ ON-CHAIN"
+                else:
+                    stop_str = f"${stop:,.2f} (soft - order failed)"
             
             post_telegram(
                 f"{emoji} *#{pos.coin} Trail Started*\n\n"
@@ -233,57 +264,34 @@ def process_position(pos: TrackedPosition, current_price: float) -> None:
     
     # Calculate new stop
     new_stop = calculate_stop(pos, current_price)
-    pos.last_stop = new_stop
     
-    # Notify on significant stop movement
-    if price_updated and pos.last_notified_stop > 0:
+    # Update stop order if moved significantly
+    if price_updated and pos.last_notified_stop > 0 and new_stop != float('inf') and new_stop != 0:
         stop_move = abs(new_stop - pos.last_notified_stop) / pos.last_notified_stop
         if stop_move >= SIGNIFICANT_MOVE:
+            new_oid = place_stop_order(pos.coin, pos.side, pos.size, new_stop)
+            if new_oid:
+                pos.stop_order_oid = new_oid
+                order_status = "on-chain"
+            else:
+                order_status = "soft"
+            
+            pos.last_stop = new_stop
+            pos.last_notified_stop = new_stop
+            
             emoji = "📈" if pos.side == "long" else "📉"
             direction = "↑" if pos.side == "long" else "↓"
+            
             post_telegram(
                 f"{emoji} *#{pos.coin} Stop Moved*\n\n"
                 f"Side: {pos.side.upper()}\n"
                 f"Price: ${current_price:,.2f}\n"
-                f"New Stop: ${new_stop:,.2f} {direction}\n"
+                f"New Stop: ${new_stop:,.2f} {direction} ({order_status})\n"
                 f"PnL: {'+' if pnl_pct >= 0 else ''}{pnl_pct*100:.2f}%\n\n"
                 f"📡 TrailingStop"
             )
-            pos.last_notified_stop = new_stop
     
-    # Check if stop triggered
-    if check_stop_triggered(pos, current_price):
-        emoji = "🔴" if pos.side == "long" else "🟢"
-        post_telegram(
-            f"⚠️ *#{pos.coin} Stop Triggered*\n\n"
-            f"Side: {pos.side.upper()}\n"
-            f"Size: {pos.size}\n"
-            f"Entry: ${pos.entry_price:,.2f}\n"
-            f"Exit: ${current_price:,.2f}\n"
-            f"Stop: ${pos.last_stop:,.2f}\n"
-            f"PnL: {'+' if pnl_pct >= 0 else ''}{pnl_pct*100:.2f}%\n\n"
-            f"Closing position...\n\n"
-            f"📡 TrailingStop"
-        )
-        
-        # Execute close
-        success = close_position(pos.coin, pos.side, pos.size)
-        
-        if success:
-            post_telegram(
-                f"✅ *#{pos.coin} Position Closed*\n\n"
-                f"Final PnL: {'+' if pnl_pct >= 0 else ''}{pnl_pct*100:.2f}%\n\n"
-                f"📡 TrailingStop"
-            )
-            # Remove from tracking
-            if pos.coin in positions:
-                del positions[pos.coin]
-        else:
-            post_telegram(
-                f"❌ *#{pos.coin} Close Failed*\n\n"
-                f"Manual intervention required!\n\n"
-                f"📡 TrailingStop"
-            )
+    pos.last_stop = new_stop
 
 
 def sync_positions() -> None:
@@ -294,21 +302,19 @@ def sync_positions() -> None:
     if not current_positions:
         return
     
-    # Build set of current position coins
     current_coins = set()
     
     for pos_data in current_positions:
-        coin = pos_data.get("coin", pos_data.get("symbol", ""))
-        size = float(pos_data.get("szi", pos_data.get("size", 0)))
+        coin = pos_data.get("coin", "")
+        size = pos_data.get("size", 0)
         
         if size == 0:
             continue
         
         current_coins.add(coin)
         side = "long" if size > 0 else "short"
-        entry_price = float(pos_data.get("entryPx", pos_data.get("entry_price", 0)))
+        entry_price = pos_data.get("entry_price", 0)
         
-        # New position
         if coin not in positions:
             positions[coin] = TrackedPosition(
                 coin=coin,
@@ -320,49 +326,69 @@ def sync_positions() -> None:
             )
             print(f"Tracking new position: {coin} {side} {size} @ {entry_price}")
         else:
-            # Update size if changed
             positions[coin].size = abs(size)
     
-    # Remove closed positions
     closed = [c for c in positions if c not in current_coins]
     for coin in closed:
-        print(f"Position closed externally: {coin}")
+        pos = positions[coin]
+        print(f"Position closed: {coin}")
+        
+        # Notify about position closure (likely SL hit)
+        if pos.trailing_active and pos.stop_order_oid:
+            post_telegram(
+                f"🛑 *#{coin} STOP EXECUTED*\n\n"
+                f"Side: {pos.side.upper()}\n"
+                f"Size: {pos.size}\n"
+                f"Entry: ${pos.entry_price:,.2f}\n"
+                f"Stop was: ${pos.last_stop:,.2f}\n\n"
+                f"Position closed by on-chain stop order.\n\n"
+                f"📡 TrailingStop"
+            )
+        
         del positions[coin]
 
 
 def main():
     print(f"[{datetime.now(timezone.utc).isoformat()}] Trailing Stop started")
     print(f"Config: {TRAIL_PERCENT*100}% trail, {ACTIVATION_PERCENT*100}% activation, {POLL_INTERVAL}s interval")
+    print(f"Address: {ADDRESS}")
+    print(f"Mode: ✅ ON-CHAIN stops via Hyperliquid SDK")
     
     post_telegram(
         "🚀 *Trailing Stop Started*\n\n"
         f"Trail: {TRAIL_PERCENT*100:.1f}%\n"
-        f"Activation: {ACTIVATION_PERCENT*100:.1f}% profit\n"
-        f"Poll: {POLL_INTERVAL}s\n\n"
+        f"Activation: In profit zone\n"
+        f"Poll: {POLL_INTERVAL}s\n"
+        f"Mode: ✅ ON-CHAIN stops\n\n"
         f"📡 TrailingStop"
     )
     
     while True:
         try:
-            # Sync with actual positions
             sync_positions()
             
-            # Process each tracked position
             for coin, pos in list(positions.items()):
                 price = get_price(coin)
                 if price:
                     process_position(pos, price)
             
-            # Status log
             if positions:
-                status = ", ".join(
-                    f"{c}: {'🟢' if p.trailing_active else '⏳'}"
-                    for c, p in positions.items()
-                )
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Tracking: {status}")
+                status_parts = []
+                for c, p in positions.items():
+                    if p.trailing_active:
+                        if (p.side == "long" and p.last_stop == 0) or (p.side == "short" and p.last_stop == float('inf')):
+                            status_parts.append(f"{c}: ⏳")
+                        else:
+                            chain = "✅" if p.stop_order_oid else "⚠️"
+                            status_parts.append(f"{c}: {chain} SL@{p.last_stop:.2f}")
+                    else:
+                        status_parts.append(f"{c}: ⏳")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {', '.join(status_parts)}")
             
         except Exception as e:
             print(f"Error in main loop: {e}")
+            import traceback
+            traceback.print_exc()
         
         time.sleep(POLL_INTERVAL)
 
