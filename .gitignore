@@ -1,11 +1,33 @@
+# Environment
 .env
 .env.*
-data/*.db
-logs/*.log
+!.env.example
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .venv/
+venv/
+*.egg-info/
+
+# IDE
 .claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data & Logs
+data/*.db
+data/*.sqlite
+data/*.json
+logs/*.log
+logs/*.txt
+
+# Screenshots & Debug
 screenshots/
-*.sqlite
-*.db
+
+# OS
+.DS_Store
+Thumbs.db
