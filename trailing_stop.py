@@ -266,7 +266,8 @@ def process_position(pos: TrackedPosition, current_price: float) -> None:
             emoji = "🟢" if pos.side == "long" else "🔴"
             
             if (pos.side == "long" and stop == 0) or (pos.side == "short" and stop == float('inf')):
-                stop_str = "waiting for profit"
+                # Not in profit zone yet, no notification
+                pass
             else:
                 oid = place_stop_order(pos.coin, pos.side, pos.size, stop, pos.dex)
                 if oid:
@@ -274,17 +275,18 @@ def process_position(pos: TrackedPosition, current_price: float) -> None:
                     stop_str = f"{fmt_price(stop)} ✅ ON-CHAIN"
                 else:
                     stop_str = f"{fmt_price(stop)} (soft - order failed)"
-            
-            post_telegram(
-                f"{emoji} *#{pos.coin} Trail Started*\n\n"
-                f"Side: {pos.side.upper()}\n"
-                f"Size: {pos.size}\n"
-                f"Entry: {fmt_price(pos.entry_price)}\n"
-                f"Current: {fmt_price(current_price)}\n"
-                f"PnL: {'+' if pnl_pct >= 0 else ''}{pnl_pct*100:.2f}%\n"
-                f"Stop: {stop_str} ({TRAIL_PERCENT*100:.1f}% trail)\n\n"
-                f"📡 TrailingStop"
-            )
+                
+                # Only notify when stop is actually placed
+                post_telegram(
+                    f"{emoji} *#{pos.coin} Trail Started*\n\n"
+                    f"Side: {pos.side.upper()}\n"
+                    f"Size: {pos.size}\n"
+                    f"Entry: {fmt_price(pos.entry_price)}\n"
+                    f"Current: {fmt_price(current_price)}\n"
+                    f"PnL: {'+' if pnl_pct >= 0 else ''}{pnl_pct*100:.2f}%\n"
+                    f"Stop: {stop_str} ({TRAIL_PERCENT*100:.1f}% trail)\n\n"
+                    f"📡 TrailingStop"
+                )
         return
     
     # Update peak/trough
