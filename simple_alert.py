@@ -68,8 +68,12 @@ def save_cached_pnl(trader_address: str, pnl_data: dict):
         print(f"Cache write error: {e}")
 
 
-def fetch_trader_position(trader_address: str, token_symbol: str) -> dict | None:
-    """Fetch current position details for a trader on a specific token."""
+def fetch_trader_position(trader_address: str, token_symbol: str, expected_side: str) -> dict | None:
+    """Fetch current position details for a trader on a specific token.
+    
+    Only returns data if the position side matches expected_side to avoid
+    showing stale/mismatched leverage info.
+    """
     print(f"  Fetching position for {trader_address[:10]}... on {token_symbol}")
     
     try:
@@ -87,6 +91,11 @@ def fetch_trader_position(trader_address: str, token_symbol: str) -> dict | None
             data = resp.json()
             if data.get("data"):
                 record = data["data"][0]
+                # Only return if side matches what we're alerting
+                position_side = record.get("side", "")
+                if position_side.lower() != expected_side.lower():
+                    print(f"  Position side mismatch: {position_side} vs {expected_side}")
+                    return None
                 return {
                     "leverage": record.get("leverage"),
                     "leverage_type": record.get("leverage_type"),
@@ -352,8 +361,8 @@ def main():
         # Fetch PnL data (uses cache if available)
         pnl_data = fetch_trader_pnl(alert["address"])
         
-        # Fetch current position data (leverage, liquidation)
-        position_data = fetch_trader_position(alert["address"], alert["token_raw"])
+        # Fetch current position data (leverage, liquidation) - only if side matches
+        position_data = fetch_trader_position(alert["address"], alert["token_raw"], alert["side"])
         
         message = format_alert(alert, pnl_data, position_data)
         success = post_telegram(message)
