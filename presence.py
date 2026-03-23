@@ -54,86 +54,47 @@ def is_screen_locked() -> bool:
 
 
 def is_face_detected() -> bool:
-    """Use camera to detect if a person is present."""
-    # First try direct OpenCV access
-    try:
-        import cv2
-        
-        cap = cv2.VideoCapture(0)
-        if cap.isOpened():
-            ret, frame = cap.read()
-            cap.release()
-            
-            if ret and frame is not None:
-                face_cascade = cv2.CascadeClassifier(
-                    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-                )
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-                
-                detected = len(faces) > 0
-                print(f"Face detection: {'detected' if detected else 'not detected'}")
-                return detected
-        
-        # If OpenCV fails, try via osascript/imagesnap
-        print("OpenCV camera access denied, trying imagesnap fallback...")
-        return _face_detect_via_imagesnap()
-        
-    except ImportError:
-        print("OpenCV not installed, trying imagesnap fallback...")
-        return _face_detect_via_imagesnap()
-    except Exception as e:
-        print(f"Face detection failed: {e}")
-        return False
-
-
-def _face_detect_via_imagesnap() -> bool:
-    """Fallback face detection using imagesnap CLI (if installed)."""
-    import tempfile
+    """Use FaceCheck.app to detect if a person is present."""
     import os
+    from pathlib import Path
+    
+    # Path to the FaceCheck app
+    script_dir = Path(__file__).parent
+    app_path = script_dir / "FaceCheck.app"
+    result_path = Path("/tmp/facecheck_result.txt")
+    
+    if not app_path.exists():
+        print("FaceCheck.app not found")
+        return False
     
     try:
-        # Check if imagesnap is available
-        result = subprocess.run(["which", "imagesnap"], capture_output=True, text=True)
-        if result.returncode != 0:
-            print("imagesnap not installed (brew install imagesnap)")
-            return False
+        # Remove old result
+        if result_path.exists():
+            result_path.unlink()
         
-        # Capture image
-        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
-            tmp_path = f.name
-        
+        # Run FaceCheck app (must use 'open' to get camera permission)
         result = subprocess.run(
-            ["imagesnap", "-q", tmp_path],
+            ["open", "-W", str(app_path)],
             capture_output=True,
             text=True,
             timeout=10
         )
         
-        if result.returncode != 0 or not os.path.exists(tmp_path):
-            print("imagesnap capture failed")
+        # Read result
+        if result_path.exists():
+            content = result_path.read_text().strip()
+            detected = content == "PRESENT"
+            print(f"Face detection (FaceCheck.app): {content}")
+            return detected
+        else:
+            print("FaceCheck.app did not produce result")
             return False
-        
-        # Detect face in captured image
-        import cv2
-        frame = cv2.imread(tmp_path)
-        os.unlink(tmp_path)
-        
-        if frame is None:
-            return False
-        
-        face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        )
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-        
-        detected = len(faces) > 0
-        print(f"Face detection (imagesnap): {'detected' if detected else 'not detected'}")
-        return detected
-        
+            
+    except subprocess.TimeoutExpired:
+        print("FaceCheck.app timed out")
+        return False
     except Exception as e:
-        print(f"imagesnap fallback failed: {e}")
+        print(f"FaceCheck.app failed: {e}")
         return False
 
 
