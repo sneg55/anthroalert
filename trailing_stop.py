@@ -190,14 +190,19 @@ def place_stop_order(coin: str, side: str, size: float, trigger_price: float, de
         # For closing: buy to close short, sell to close long
         is_buy = side == "short"
         
-        # Round prices
-        trigger_price = round(trigger_price, 1)
-        
-        # Limit price with slippage
-        if is_buy:
-            limit_price = round(trigger_price * 1.02, 1)
+        # Round prices - BTC needs integer, others need 1 decimal
+        if coin == "BTC":
+            trigger_price = round(trigger_price)
+            if is_buy:
+                limit_price = round(trigger_price * 1.02)
+            else:
+                limit_price = round(trigger_price * 0.98)
         else:
-            limit_price = round(trigger_price * 0.98, 1)
+            trigger_price = round(trigger_price, 1)
+            if is_buy:
+                limit_price = round(trigger_price * 1.02, 1)
+            else:
+                limit_price = round(trigger_price * 0.98, 1)
         
         print(f"Placing stop: {coin} trigger={trigger_price} limit={limit_price}")
         
