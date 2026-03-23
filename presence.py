@@ -55,22 +55,73 @@ def is_screen_locked() -> bool:
 
 def is_face_detected() -> bool:
     """Use camera to detect if a person is present."""
+    # First try direct OpenCV access
     try:
         import cv2
         
-        # Capture a frame
         cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            print("Camera not available")
+        if cap.isOpened():
+            ret, frame = cap.read()
+            cap.release()
+            
+            if ret and frame is not None:
+                face_cascade = cv2.CascadeClassifier(
+                    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+                )
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+                
+                detected = len(faces) > 0
+                print(f"Face detection: {'detected' if detected else 'not detected'}")
+                return detected
+        
+        # If OpenCV fails, try via osascript/imagesnap
+        print("OpenCV camera access denied, trying imagesnap fallback...")
+        return _face_detect_via_imagesnap()
+        
+    except ImportError:
+        print("OpenCV not installed, trying imagesnap fallback...")
+        return _face_detect_via_imagesnap()
+    except Exception as e:
+        print(f"Face detection failed: {e}")
+        return False
+
+
+def _face_detect_via_imagesnap() -> bool:
+    """Fallback face detection using imagesnap CLI (if installed)."""
+    import tempfile
+    import os
+    
+    try:
+        # Check if imagesnap is available
+        result = subprocess.run(["which", "imagesnap"], capture_output=True, text=True)
+        if result.returncode != 0:
+            print("imagesnap not installed (brew install imagesnap)")
             return False
         
-        ret, frame = cap.read()
-        cap.release()
+        # Capture image
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+            tmp_path = f.name
         
-        if not ret or frame is None:
+        result = subprocess.run(
+            ["imagesnap", "-q", tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode != 0 or not os.path.exists(tmp_path):
+            print("imagesnap capture failed")
             return False
         
-        # Face detection
+        # Detect face in captured image
+        import cv2
+        frame = cv2.imread(tmp_path)
+        os.unlink(tmp_path)
+        
+        if frame is None:
+            return False
+        
         face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         )
@@ -78,14 +129,11 @@ def is_face_detected() -> bool:
         faces = face_cascade.detectMultiScale(gray, 1.1, 4)
         
         detected = len(faces) > 0
-        print(f"Face detection: {'detected' if detected else 'not detected'}")
+        print(f"Face detection (imagesnap): {'detected' if detected else 'not detected'}")
         return detected
         
-    except ImportError:
-        print("OpenCV not installed, skipping camera check")
-        return False
     except Exception as e:
-        print(f"Face detection failed: {e}")
+        print(f"imagesnap fallback failed: {e}")
         return False
 
 
@@ -116,9 +164,19 @@ def is_user_present() -> bool:
         print("User away (idle > 1 hour)")
         return False
     
-    # Idle 15-60 min - use camera fallback
+    # Idle 15-60 min - try camera fallback, but don't require it
     print("Checking camera (idle 15-60 min)...")
-    return is_face_detected()
+    try:
+        result = is_face_detected()
+        if result:
+            return True
+        # Camera failed or no face - be conservative, assume away
+        print("Camera check inconclusive, assuming away")
+        return False
+    except Exception:
+        # Camera not available - fall back to assuming away if idle > 15 min
+        print("Camera unavailable, assuming away (idle > 15 min)")
+        return False
 
 
 if __name__ == "__main__":
