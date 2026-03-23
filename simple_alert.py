@@ -341,8 +341,26 @@ def post_telegram(message):
     return resp.json().get("ok", False)
 
 
+def check_user_present() -> bool:
+    """Check if user is present using presence detection."""
+    try:
+        from presence import is_user_present
+        return is_user_present()
+    except ImportError:
+        print("Presence module not found, assuming present")
+        return True
+    except Exception as e:
+        print(f"Presence check error: {e}, assuming present")
+        return True
+
+
 def main():
     print(f"[{datetime.now(timezone.utc).isoformat()}] AnthroAlert running...")
+    
+    # Check if user is present before scanning
+    if not check_user_present():
+        print("User not present - skipping alert scan")
+        return
     
     # Fetch trades
     trades = fetch_perp_trades()
