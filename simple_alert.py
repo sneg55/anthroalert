@@ -68,6 +68,31 @@ def save_cached_pnl(trader_address: str, pnl_data: dict):
         print(f"Cache write error: {e}")
 
 
+def verify_trader_position_side(trader_address: str, token_symbol: str) -> str | None:
+    """Verify the trader's current position side for a token.
+    
+    Returns 'Long', 'Short', or None if no position.
+    """
+    try:
+        resp = requests.post(
+            "https://api.nansen.ai/api/v1/tgm/perp-positions",
+            headers={"apiKey": NANSEN_API_KEY, "Content-Type": "application/json"},
+            json={
+                "token_symbol": token_symbol,
+                "filters": {"address": trader_address},
+                "pagination": {"page": 1, "per_page": 1},
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("data"):
+                return data["data"][0].get("side")
+    except Exception as e:
+        print(f"  Position verify error: {e}")
+    return None
+
+
 def fetch_trader_position(trader_address: str, token_symbol: str, expected_side: str) -> dict | None:
     """Fetch current position details for a trader on a specific token.
     
@@ -230,6 +255,19 @@ def analyze_trades(trades):
         
         # Alert conditions
         if cluster["total_value"] >= MIN_CLUSTER_VALUE or (is_notable and cluster["total_value"] >= MIN_VALUE_USD):
+            # Verify current position side matches trade side
+            # Trade "Long" = buying = should result in Long position
+            # Trade "Short" = selling = should result in Short position
+            actual_side = verify_trader_position_side(cluster["address"], cluster["token"])
+            
+            if actual_side is None:
+                print(f"  Skipping {cluster['token']} - no current position (likely closed)")
+                continue
+            
+            if actual_side.lower() != cluster["side"].lower():
+                print(f"  Skipping {cluster['token']} - trade side {cluster['side']} but position is {actual_side}")
+                continue
+            
             # Calculate average fill price
             total_size = sum(t["token_amount"] for t in cluster["trades"])
             avg_price = cluster["total_value"] / total_size if total_size > 0 else 0
@@ -240,7 +278,7 @@ def analyze_trades(trades):
                 "address_short": cluster["address"][:10] + "..." + cluster["address"][-6:],
                 "token": cluster["token"],
                 "token_raw": cluster["token"],  # Keep original for API calls
-                "side": cluster["side"],
+                "side": actual_side,  # Use verified position side
                 "trade_count": len(cluster["trades"]),
                 "total_value": cluster["total_value"],
                 "avg_price": avg_price,
