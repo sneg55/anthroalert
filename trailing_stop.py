@@ -28,10 +28,14 @@ from hyperliquid.utils import constants
 load_dotenv()
 
 # Config
-TRAIL_PERCENT = 0.01  # 1%
+TRAIL_PERCENT = 0.005  # 0.5%
 ACTIVATION_PERCENT = 0  # Activate immediately (in profit zone)
 POLL_INTERVAL = 30  # seconds
 SIGNIFICANT_MOVE = 0.005  # 0.5% move to update stop order
+
+# Self-healing config
+MAX_CONSECUTIVE_FAILURES = 5
+VERIFY_INTERVAL = 5  # Verify stops every N poll cycles
 
 
 def fmt_price(price: float) -> str:
@@ -51,6 +55,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Initialize Hyperliquid clients
+if not PRIVATE_KEY:
+    sys.exit("HYPERLIQUID_PRIVATE_KEY not set in .env")
 account = Account.from_key(PRIVATE_KEY)
 ADDRESS = account.address
 info = Info(constants.MAINNET_API_URL, skip_ws=True)
@@ -74,6 +80,8 @@ class TrackedPosition:
 
 # Global state
 positions: Dict[str, TrackedPosition] = {}
+consecutive_failures: int = 0
+poll_count: int = 0
 
 
 def post_telegram(message: str) -> bool:
@@ -143,7 +151,10 @@ def get_price(coin: str) -> Optional[float]:
     """Get current mid price for a coin."""
     try:
         all_mids = info.all_mids()
-        return float(all_mids.get(coin, 0))
+        raw = all_mids.get(coin)
+        if raw is None:
+            return None
+        return float(raw)
     except Exception as e:
         print(f"Error getting price for {coin}: {e}")
         return None
@@ -178,8 +189,48 @@ def cancel_order(oid: int, coin: str) -> bool:
         return False
 
 
+def verify_stop_exists(oid: int) -> bool:
+    """Verify a stop order still exists on-chain."""
+    try:
+        orders = info.open_orders(ADDRESS)
+        return any(o.get('oid') == oid for o in orders)
+    except Exception as e:
+        print(f"Error verifying stop: {e}")
+        return False
+
+
+def get_all_stop_oids() -> set:
+    """Get all current stop order IDs on-chain."""
+    try:
+        orders = info.open_orders(ADDRESS)
+        return {o.get('oid') for o in orders if o.get('orderType') in ['Stop Market', 'Stop Limit']}
+    except Exception as e:
+        print(f"Error getting stop oids: {e}")
+        return set()
+
+
+def verify_all_stops() -> None:
+    """Verify all tracked stops exist on-chain, re-place if missing."""
+    global positions
+    
+    on_chain_oids = get_all_stop_oids()
+    
+    for key, pos in positions.items():
+        if pos.stop_order_oid and pos.stop_order_oid not in on_chain_oids:
+            print(f"⚠️ Stop missing for {pos.coin} (oid {pos.stop_order_oid}), re-placing...")
+            pos.stop_order_oid = None  # Force re-place
+            
+            if pos.trailing_active and pos.last_stop > 0 and pos.last_stop != float('inf'):
+                new_oid = place_stop_order(pos.coin, pos.side, pos.size, pos.last_stop, pos.dex)
+                if new_oid:
+                    pos.stop_order_oid = new_oid
+                    print(f"✅ Stop re-placed for {pos.coin} @ {pos.last_stop}")
+
+
 def place_stop_order(coin: str, side: str, size: float, trigger_price: float, dex: Optional[str] = None) -> Optional[int]:
     """Place a stop-loss order on Hyperliquid. Returns order ID if successful."""
+    global consecutive_failures
+    
     try:
         # Cancel any existing stops for this coin first
         existing = get_existing_stops(coin, dex)
@@ -220,15 +271,26 @@ def place_stop_order(coin: str, side: str, size: float, trigger_price: float, de
             if statuses and "resting" in statuses[0]:
                 oid = statuses[0]["resting"].get("oid")
                 print(f"✅ Stop placed: {coin} @ ${trigger_price} (oid: {oid})")
-                return oid
+                
+                # Verify the stop actually exists
+                time.sleep(1)
+                if verify_stop_exists(oid):
+                    consecutive_failures = 0  # Reset on success
+                    return oid
+                else:
+                    print(f"⚠️ Stop placed but not found on-chain!")
+                    consecutive_failures += 1
+                    return None
         
         print(f"❌ Failed to place stop: {result}")
+        consecutive_failures += 1
         return None
         
     except Exception as e:
         print(f"Error placing stop order: {e}")
         import traceback
         traceback.print_exc()
+        consecutive_failures += 1
         return None
 
 
@@ -337,30 +399,36 @@ def process_position(pos: TrackedPosition, current_price: float) -> None:
     pos.last_stop = new_stop
 
 
+def _pos_key(coin: str, dex: Optional[str]) -> str:
+    """Build a unique position key from coin and dex."""
+    return f"{coin}:{dex}" if dex else coin
+
+
 def sync_positions() -> None:
     """Sync tracked positions with actual positions."""
     global positions
-    
+
     current_positions = get_positions()
     if not current_positions:
         return
-    
-    current_coins = set()
-    
+
+    current_keys = set()
+
     for pos_data in current_positions:
         coin = pos_data.get("coin", "")
         size = pos_data.get("size", 0)
-        
+
         if size == 0:
             continue
-        
-        current_coins.add(coin)
+
+        dex = pos_data.get("dex")
+        key = _pos_key(coin, dex)
+        current_keys.add(key)
         side = "long" if size > 0 else "short"
         entry_price = pos_data.get("entry_price", 0)
-        
-        if coin not in positions:
-            dex = pos_data.get("dex")
-            positions[coin] = TrackedPosition(
+
+        if key not in positions:
+            positions[key] = TrackedPosition(
                 coin=coin,
                 side=side,
                 size=abs(size),
@@ -372,17 +440,31 @@ def sync_positions() -> None:
             dex_str = f" (dex={dex})" if dex else ""
             print(f"Tracking new position: {coin} {side} {size} @ {entry_price}{dex_str}")
         else:
-            positions[coin].size = abs(size)
-    
-    closed = [c for c in positions if c not in current_coins]
-    for coin in closed:
-        pos = positions[coin]
-        print(f"Position closed: {coin}")
-        
+            existing = positions[key]
+            if existing.side != side or existing.entry_price != entry_price:
+                # Position flipped or re-entered — reset tracking
+                print(f"Position changed: {coin} {existing.side}→{side} @ {entry_price}")
+                positions[key] = TrackedPosition(
+                    coin=coin,
+                    side=side,
+                    size=abs(size),
+                    entry_price=entry_price,
+                    dex=dex,
+                    highest_price=entry_price,
+                    lowest_price=entry_price,
+                )
+            else:
+                existing.size = abs(size)
+
+    closed = [k for k in positions if k not in current_keys]
+    for key in closed:
+        pos = positions[key]
+        print(f"Position closed: {pos.coin}")
+
         # Notify about position closure (likely SL hit)
         if pos.trailing_active and pos.stop_order_oid:
             post_telegram(
-                f"🛑 *#{coin} STOP EXECUTED*\n\n"
+                f"🛑 *#{pos.coin} STOP EXECUTED*\n\n"
                 f"Side: {pos.side.upper()}\n"
                 f"Size: {pos.size}\n"
                 f"Entry: {fmt_price(pos.entry_price)}\n"
@@ -390,51 +472,88 @@ def sync_positions() -> None:
                 f"Position closed by on-chain stop order.\n\n"
                 f"📡 TrailingStop"
             )
-        
-        del positions[coin]
+
+        del positions[key]
+
+
+def restart_self():
+    """Restart the script."""
+    print("🔄 Too many failures, restarting...")
+    post_telegram(
+        "🔄 *Trailing Stop Restarting*\n\n"
+        f"Reason: {MAX_CONSECUTIVE_FAILURES} consecutive failures\n"
+        f"Auto-recovery in progress...\n\n"
+        f"📡 TrailingStop"
+    )
+    time.sleep(2)
+    os.execv(sys.executable, ['python'] + sys.argv)
 
 
 def main():
+    global consecutive_failures, poll_count
+    
     print(f"[{datetime.now(timezone.utc).isoformat()}] Trailing Stop started")
     print(f"Config: {TRAIL_PERCENT*100}% trail, {ACTIVATION_PERCENT*100}% activation, {POLL_INTERVAL}s interval")
     print(f"Address: {ADDRESS}")
     print(f"Mode: ✅ ON-CHAIN stops via Hyperliquid SDK")
+    print(f"Self-healing: restart after {MAX_CONSECUTIVE_FAILURES} failures, verify every {VERIFY_INTERVAL} cycles")
     
     post_telegram(
         "🚀 *Trailing Stop Started*\n\n"
         f"Trail: {TRAIL_PERCENT*100:.1f}%\n"
         f"Activation: In profit zone\n"
         f"Poll: {POLL_INTERVAL}s\n"
-        f"Mode: ✅ ON-CHAIN stops\n\n"
+        f"Mode: ✅ ON-CHAIN stops\n"
+        f"Self-healing: ✅ enabled\n\n"
         f"📡 TrailingStop"
     )
     
     while True:
         try:
+            poll_count += 1
+            
+            # Check if we need to self-heal
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                restart_self()
+            
             sync_positions()
             
-            for coin, pos in list(positions.items()):
-                price = get_price(coin)
+            # Periodic verification of all stops
+            if poll_count % VERIFY_INTERVAL == 0:
+                verify_all_stops()
+            
+            for key, pos in list(positions.items()):
+                price = get_price(pos.coin)
                 if price:
                     process_position(pos, price)
-            
+                else:
+                    # Price fetch failed
+                    consecutive_failures += 1
+
             if positions:
                 status_parts = []
-                for c, p in positions.items():
+                for key, p in positions.items():
+                    label = p.coin if not p.dex else f"{p.coin}:{p.dex}"
                     if p.trailing_active:
                         if (p.side == "long" and p.last_stop == 0) or (p.side == "short" and p.last_stop == float('inf')):
-                            status_parts.append(f"{c}: ⏳")
+                            status_parts.append(f"{label}: ⏳")
                         else:
                             chain = "✅" if p.stop_order_oid else "⚠️"
-                            status_parts.append(f"{c}: {chain} SL@{p.last_stop:.2f}")
+                            status_parts.append(f"{label}: {chain} SL@{p.last_stop:.2f}")
                     else:
-                        status_parts.append(f"{c}: ⏳")
+                        status_parts.append(f"{label}: ⏳")
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {', '.join(status_parts)}")
+            
+            # Reset failure count on successful loop with positions
+            if positions:
+                # Only reset if we successfully processed at least one position with a price
+                pass  # Failures reset happens in place_stop_order on success
             
         except Exception as e:
             print(f"Error in main loop: {e}")
             import traceback
             traceback.print_exc()
+            consecutive_failures += 1
         
         time.sleep(POLL_INTERVAL)
 
