@@ -14,8 +14,9 @@ sys.stderr.reconfigure(line_buffering=True)
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, Optional, List
 
 import requests as http_requests
@@ -36,6 +37,7 @@ SIGNIFICANT_MOVE = 0.005  # 0.5% move to update stop order
 # Self-healing config
 MAX_CONSECUTIVE_FAILURES = 5
 VERIFY_INTERVAL = 5  # Verify stops every N poll cycles
+STATE_FILE = Path(__file__).parent / "data" / "trailing_state.json"
 
 
 def fmt_price(price: float) -> str:
@@ -82,6 +84,59 @@ class TrackedPosition:
 positions: Dict[str, TrackedPosition] = {}
 consecutive_failures: int = 0
 poll_count: int = 0
+
+
+def save_state() -> None:
+    """Save tracking state to disk."""
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        state = {}
+        for key, pos in positions.items():
+            state[key] = {
+                "coin": pos.coin,
+                "side": pos.side,
+                "size": pos.size,
+                "entry_price": pos.entry_price,
+                "dex": pos.dex,
+                "highest_price": pos.highest_price,
+                "lowest_price": pos.lowest_price if pos.lowest_price != float("inf") else None,
+                "trailing_active": pos.trailing_active,
+                "last_stop": pos.last_stop if pos.last_stop != float("inf") else None,
+                "last_notified_stop": pos.last_notified_stop,
+                "stop_order_oid": pos.stop_order_oid,
+            }
+        STATE_FILE.write_text(json.dumps(state, indent=2))
+    except Exception as e:
+        print(f"Error saving state: {e}")
+
+
+def load_state() -> Dict[str, TrackedPosition]:
+    """Load tracking state from disk."""
+    if not STATE_FILE.exists():
+        return {}
+    
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        loaded = {}
+        for key, s in data.items():
+            loaded[key] = TrackedPosition(
+                coin=s["coin"],
+                side=s["side"],
+                size=s["size"],
+                entry_price=s["entry_price"],
+                dex=s.get("dex"),
+                highest_price=s.get("highest_price", s["entry_price"]),
+                lowest_price=s.get("lowest_price") if s.get("lowest_price") is not None else float("inf"),
+                trailing_active=s.get("trailing_active", False),
+                last_stop=s.get("last_stop") if s.get("last_stop") is not None else 0.0,
+                last_notified_stop=s.get("last_notified_stop", 0.0),
+                stop_order_oid=s.get("stop_order_oid"),
+            )
+        print(f"Loaded state for {len(loaded)} positions")
+        return loaded
+    except Exception as e:
+        print(f"Error loading state: {e}")
+        return {}
 
 
 def post_telegram(message: str) -> bool:
@@ -474,6 +529,10 @@ def sync_positions() -> None:
             )
 
         del positions[key]
+    
+    # Save state after any changes
+    if current_keys or closed:
+        save_state()
 
 
 def restart_self():
@@ -490,13 +549,16 @@ def restart_self():
 
 
 def main():
-    global consecutive_failures, poll_count
+    global consecutive_failures, poll_count, positions
     
     print(f"[{datetime.now(timezone.utc).isoformat()}] Trailing Stop started")
     print(f"Config: {TRAIL_PERCENT*100}% trail, {ACTIVATION_PERCENT*100}% activation, {POLL_INTERVAL}s interval")
     print(f"Address: {ADDRESS}")
     print(f"Mode: ✅ ON-CHAIN stops via Hyperliquid SDK")
     print(f"Self-healing: restart after {MAX_CONSECUTIVE_FAILURES} failures, verify every {VERIFY_INTERVAL} cycles")
+    
+    # Load saved state
+    positions = load_state()
     
     post_telegram(
         "🚀 *Trailing Stop Started*\n\n"
@@ -529,6 +591,10 @@ def main():
                 else:
                     # Price fetch failed
                     consecutive_failures += 1
+            
+            # Save state after processing
+            if positions:
+                save_state()
 
             if positions:
                 status_parts = []
