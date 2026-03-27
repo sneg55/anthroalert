@@ -560,15 +560,7 @@ def main():
     # Load saved state
     positions = load_state()
     
-    post_telegram(
-        "🚀 *Trailing Stop Started*\n\n"
-        f"Trail: {TRAIL_PERCENT*100:.1f}%\n"
-        f"Activation: In profit zone\n"
-        f"Poll: {POLL_INTERVAL}s\n"
-        f"Mode: ✅ ON-CHAIN stops\n"
-        f"Self-healing: ✅ enabled\n\n"
-        f"📡 TrailingStop"
-    )
+    # No startup notification - only notify when SL is actually placed
     
     while True:
         try:
@@ -588,9 +580,7 @@ def main():
                 price = get_price(pos.coin)
                 if price:
                     process_position(pos, price)
-                else:
-                    # Price fetch failed
-                    consecutive_failures += 1
+                # Note: price=None is normal for illiquid assets, not counted as failure
             
             # Save state after processing
             if positions:
@@ -610,10 +600,8 @@ def main():
                         status_parts.append(f"{label}: ⏳")
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {', '.join(status_parts)}")
             
-            # Reset failure count on successful loop with positions
-            if positions:
-                # Only reset if we successfully processed at least one position with a price
-                pass  # Failures reset happens in place_stop_order on success
+            # Reset failure count on successful loop (no exceptions)
+            consecutive_failures = 0
             
         except Exception as e:
             print(f"Error in main loop: {e}")
