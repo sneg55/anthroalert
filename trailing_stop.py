@@ -271,15 +271,21 @@ def verify_all_stops() -> None:
     on_chain_oids = get_all_stop_oids()
     
     for key, pos in positions.items():
-        if pos.stop_order_oid and pos.stop_order_oid not in on_chain_oids:
-            print(f"⚠️ Stop missing for {pos.coin} (oid {pos.stop_order_oid}), re-placing...")
-            pos.stop_order_oid = None  # Force re-place
+        # Check if stop should exist but doesn't
+        should_have_stop = pos.trailing_active and pos.last_stop > 0 and pos.last_stop != float('inf')
+        has_valid_stop = pos.stop_order_oid and pos.stop_order_oid in on_chain_oids
+        
+        if should_have_stop and not has_valid_stop:
+            if pos.stop_order_oid:
+                print(f"⚠️ Stop missing for {pos.coin} (oid {pos.stop_order_oid}), re-placing...")
+            else:
+                print(f"⚠️ No stop for {pos.coin}, placing...")
             
-            if pos.trailing_active and pos.last_stop > 0 and pos.last_stop != float('inf'):
-                new_oid = place_stop_order(pos.coin, pos.side, pos.size, pos.last_stop, pos.dex)
-                if new_oid:
-                    pos.stop_order_oid = new_oid
-                    print(f"✅ Stop re-placed for {pos.coin} @ {pos.last_stop}")
+            pos.stop_order_oid = None  # Clear stale oid
+            new_oid = place_stop_order(pos.coin, pos.side, pos.size, pos.last_stop, pos.dex)
+            if new_oid:
+                pos.stop_order_oid = new_oid
+                print(f"✅ Stop placed for {pos.coin} @ {pos.last_stop}")
 
 
 def place_stop_order(coin: str, side: str, size: float, trigger_price: float, dex: Optional[str] = None) -> Optional[int]:
@@ -572,8 +578,8 @@ def main():
             
             sync_positions()
             
-            # Periodic verification of all stops
-            if poll_count % VERIFY_INTERVAL == 0:
+            # Periodic verification of all stops (also on first cycle)
+            if poll_count == 1 or poll_count % VERIFY_INTERVAL == 0:
                 verify_all_stops()
             
             for key, pos in list(positions.items()):
