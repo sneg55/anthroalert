@@ -1,5 +1,11 @@
 # AnthroAlert
 
+[![License](https://img.shields.io/github/license/sneg55/anthroalert)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/sneg55/anthroalert)](https://github.com/sneg55/anthroalert/stargazers)
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=fff)
+![Anthropic](https://img.shields.io/badge/Anthropic-D97757?logo=anthropic&logoColor=fff)
+![Hyperliquid](https://img.shields.io/badge/Hyperliquid-072723)
+
 Smart money perp trade alerts for Hyperliquid. Powered by [Nansen CLI](https://github.com/nansen-ai/nansen-cli).
 
 Get notified when whales and labeled wallets (Galaxy Digital, funds, smart traders) make significant moves.
